@@ -1010,29 +1010,34 @@
         <img id="captured-img" alt="ภาพถ่าย" />
         <canvas id="face-canvas"></canvas>
 
-        <!-- Silhouette guide -->
+        <!-- Silhouette guide — ปรับสัดส่วนศีรษะ/ไหล่ให้เป็นธรรมชาติและย่อขนาดลง
+             (แก้บั๊ก: เดิม viewBox สูงยาว 200x300 (อัตราส่วน 2:3) ถูกกำหนดขนาด
+             ด้วย width:58% (height:auto) ในกรอบกล้องที่เป็น 4:3 (กว้างกว่าสูง)
+             ทำให้ความสูงที่คำนวณได้จริงเกินความสูงของกรอบกล้อง เส้นโครงร่าง
+             จึงดูใหญ่/ยาวเกินธรรมชาติและล้นออกนอกกรอบด้านล่าง แก้โดยลด viewBox
+             ให้เตี้ยลง (200x260) และลด width% ลง เพื่อให้พอดีอยู่ในกรอบ 4:3 โดยไม่ล้น -->
         <svg id="face-silhouette" xmlns="http://www.w3.org/2000/svg"
-          viewBox="0 0 200 300"
+          viewBox="0 0 200 260"
           style="position:absolute;top:50%;left:50%;transform:translate(-50%,-48%);
-                 width:58%;height:auto;pointer-events:none;z-index:2;opacity:0.18;
+                 width:42%;height:auto;pointer-events:none;z-index:2;opacity:0.18;
                  transition:opacity 0.6s ease;">
           <path d="
-            M100,18
-            C76,18 58,38 56,62
-            C54,78 55,92 57,103
-            C52,106 49,111 49,118
-            C49,126 52,132 58,134
-            C61,148 68,160 78,168
-            C76,178 72,186 65,191
-            C48,199 28,212 22,240
-            L22,300 L178,300 L178,240
-            C172,212 152,199 135,191
-            C128,186 124,178 122,168
-            C132,160 139,148 142,134
-            C148,132 151,126 151,118
-            C151,111 148,106 143,103
-            C145,92 146,78 144,62
-            C142,38 124,18 100,18 Z
+            M100,16
+            C78,16 62,34 60,56
+            C58,70 59,82 61,92
+            C56,95 53,100 53,106
+            C53,113 56,118 61,120
+            C64,132 70,142 79,149
+            C77,158 74,165 68,169
+            C53,176 35,187 29,209
+            L29,260 L171,260 L171,209
+            C165,187 147,176 132,169
+            C126,165 123,158 121,149
+            C130,142 136,132 139,120
+            C144,118 147,113 147,106
+            C147,100 144,95 139,92
+            C141,82 142,70 140,56
+            C138,34 122,16 100,16 Z
           " fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"/>
         </svg>
 
@@ -1188,6 +1193,17 @@
   let scanComplete      = false;
   let lockedBox         = null;
   let lockFailStreak    = 0; // นับจำนวนครั้งติดกันที่เช็คซ้ำแล้วไม่เจอหน้าตอน locked (กันรีเซ็ตไวเกินจากการตรวจพลาดชั่ววูบ)
+  // บั๊ค (แก้แล้ว): เดิมทุกจุดที่เรียก faceModel.estimateFaces(...) ใช้ await
+  // ตรงๆ อยู่กลาง requestAnimationFrame loop (detectFaceLoop) ทำให้เฟรมถัดไป
+  // ไม่ถูกขอ (requestAnimationFrame) จนกว่า inference (และบางจุดมี
+  // setTimeout รออีก 800ms ซ้อนด้วย) จะเสร็จ ผลคือแอนิเมชันเส้นสแกนหยุดค้าง/
+  // กระตุกเป็นจังหวะๆ ทุกครั้งที่ตรวจจับใบหน้า (ตอนเส้นวิ่งผ่านกลางภาพ และ
+  // ตอนสแกนจบไม่เจอหน้า) — แก้โดยยิง estimateFaces() แบบ fire-and-forget
+  // (ไม่ await ใน loop) แล้วใช้ detectionInFlight กันไม่ให้ยิงซ้อนกัน ส่วนการ
+  // "หน่วงสั้นๆ ก่อนสแกนใหม่" เปลี่ยนจาก await setTimeout เป็น state 'pausing'
+  // ที่เทียบเวลาแบบ non-blocking แทน เพื่อให้ rAF ขอเฟรมถัดไปได้ทุกครั้งไม่สะดุด
+  let detectionInFlight = false;
+  let pauseUntil        = 0;
 
   async function loadFaceApi() {
     const statusText = document.getElementById('face-status-text');
@@ -1290,13 +1306,14 @@
       ctx.strokeRect(8, 8, cw - 16, ch - 16);
       ctx.restore();
 
-      // ตรวจซ้ำทุก 800ms ว่าหน้ายังอยู่ไหม
-      if (now - lastDetectTime > 800) {
+      // ตรวจซ้ำทุก 800ms ว่าหน้ายังอยู่ไหม — ยิงแบบ fire-and-forget ไม่ await
+      // ใน loop (เหตุผลดูคอมเมนต์ตรงประกาศ detectionInFlight ด้านบน)
+      if (now - lastDetectTime > 800 && !detectionInFlight) {
         lastDetectTime = now;
-        try {
-          const vw = video.videoWidth||640, vh = video.videoHeight||480;
-          const minSize = vh * 0.20;
-          const preds = await faceModel.estimateFaces(video, false);
+        detectionInFlight = true;
+        const vw = video.videoWidth||640, vh = video.videoHeight||480;
+        const minSize = vh * 0.20;
+        faceModel.estimateFaces(video, false).then(preds => {
           const valid = (preds||[]).filter(p => {
             const s=p.probability?.[0]||0, x1=p.topLeft[0], y1=p.topLeft[1], x2=p.bottomRight[0], y2=p.bottomRight[1];
             return s>=0.88 && (x2-x1)>=minSize && (y2-y1)>=minSize &&
@@ -1322,7 +1339,18 @@
           } else {
             lockFailStreak = 0;
           }
-        } catch(e) {}
+        }).catch(() => {}).finally(() => { detectionInFlight = false; });
+      }
+      faceDetectionLoop = requestAnimationFrame(detectFaceLoop);
+      return;
+    }
+
+    // ── PHASE: pausing — พักสั้นๆ ก่อนเริ่ม scan ใหม่ (เทียบเวลาแบบ
+    // non-blocking แทนการ await setTimeout ใน loop เพื่อไม่ให้เฟรมค้าง) ──
+    if (scanPhase === 'pausing') {
+      ctx.clearRect(0, 0, cw, ch);
+      if (now >= pauseUntil) {
+        scanPhase = 'scanning'; scanLineY = 0; scanComplete = false; lastDetections = [];
       }
       faceDetectionLoop = requestAnimationFrame(detectFaceLoop);
       return;
@@ -1344,14 +1372,16 @@
       ctx.fillRect(0, scanLineY-28, cw, 56);
     }
 
-    // ตรวจจับ 1 ครั้งตอน scan line อยู่กลางภาพ
-    if (scanLineY >= ch*0.38 && scanLineY <= ch*0.52 && !scanComplete && now - lastDetectTime > 200) {
+    // ตรวจจับ 1 ครั้งตอน scan line อยู่กลางภาพ — ยิงแบบ fire-and-forget
+    // (ไม่ await ใน loop) เพื่อไม่ให้เฟรมค้างระหว่างรอผล inference ซึ่งเป็น
+    // สาเหตุที่เส้นสแกนดูแล๊ก/กระตุกตอนวิ่งผ่านกลางภาพ
+    if (scanLineY >= ch*0.38 && scanLineY <= ch*0.52 && !scanComplete && now - lastDetectTime > 200 && !detectionInFlight) {
       lastDetectTime = now;
       scanComplete = true;
-      try {
-        const vw = video.videoWidth||640, vh = video.videoHeight||480;
-        const minSize = vh * 0.20;
-        const preds = await faceModel.estimateFaces(video, false);
+      detectionInFlight = true;
+      const vw = video.videoWidth||640, vh = video.videoHeight||480;
+      const minSize = vh * 0.20;
+      faceModel.estimateFaces(video, false).then(preds => {
         const valid = (preds||[]).filter(p => {
           const s=p.probability?.[0]||0, x1=p.topLeft[0], y1=p.topLeft[1], x2=p.bottomRight[0], y2=p.bottomRight[1];
           return s>=0.88 && (x2-x1)>=minSize && (y2-y1)>=minSize &&
@@ -1373,7 +1403,7 @@
             landmarks: (p.landmarks||[]).map(([lx,ly])=>[lx*sx, ly*sy])
           };
         }
-      } catch(e) { lastDetections = []; }
+      }).catch(() => { lastDetections = []; }).finally(() => { detectionInFlight = false; });
     }
 
     // scan line วิ่งจบ → ประเมินผล
@@ -1388,17 +1418,27 @@
         // ซ่อน silhouette เมื่อเจอหน้าแล้ว
         const sil = document.getElementById('face-silhouette');
         if (sil) sil.style.opacity = '0';
-      } else {
-        // ❌ ไม่พบ → รอ 800ms แล้ว scan ใหม่
-        const rawPreds = await faceModel.estimateFaces(video, false).catch(()=>[]);
-        statusText.textContent = rawPreds.length > 0
-          ? 'ขยับหน้าเข้ากล้อง / ให้อยู่กลางภาพ'
-          : 'ไม่พบใบหน้า';
+      } else if (scanPhase !== 'pausing') {
+        // ❌ ไม่พบ → เข้าสถานะพัก 800ms ก่อน scan ใหม่ (แก้บั๊ก: เดิม await
+        // estimateFaces() + await setTimeout(800ms) ตรงนี้ค้างเฟรมไว้ทั้งคู่
+        // ทำให้ animation หยุดสนิทเป็นจังหวะๆ ทุกรอบที่ไม่เจอหน้า — เปลี่ยน
+        // เป็น state 'pausing' ที่ยังขอ rAF ต่อเนื่องแต่ไม่วาดเส้นสแกน แล้ว
+        // เทียบเวลาแทนการ await)
+        scanPhase = 'pausing';
+        pauseUntil = now + 800;
         dot.className = 'face-dot';
         faceDetected = false;
         updateCaptureButton();
-        await new Promise(r => setTimeout(r, 800));
-        scanLineY = 0; scanComplete = false; lastDetections = [];
+        if (!detectionInFlight) {
+          detectionInFlight = true;
+          faceModel.estimateFaces(video, false).then(rawPreds => {
+            statusText.textContent = (rawPreds||[]).length > 0
+              ? 'ขยับหน้าเข้ากล้อง / ให้อยู่กลางภาพ'
+              : 'ไม่พบใบหน้า';
+          }).catch(() => {
+            statusText.textContent = 'ไม่พบใบหน้า';
+          }).finally(() => { detectionInFlight = false; });
+        }
       }
     }
 
@@ -1686,7 +1726,7 @@
     localStorage.setItem('camera_device_id', selectedDeviceId);
     capturedImageBase64 = null;
     faceDetected = false;
-    scanPhase = 'scanning'; scanLineY = 0; scanComplete = false; lockedBox = null; lockFailStreak = 0;
+    scanPhase = 'scanning'; scanLineY = 0; scanComplete = false; lockedBox = null; lockFailStreak = 0; pauseUntil = 0;
     document.getElementById('retake-btn').classList.remove('visible');
     document.getElementById('capture-btn').style.display = 'flex';
     document.getElementById('photo-hint').style.display  = 'flex';
@@ -1747,7 +1787,7 @@
   function retakePhoto() {
     capturedImageBase64 = null;
     faceDetected = false;
-    scanPhase = 'scanning'; scanLineY = 0; scanComplete = false; lockedBox = null; lockFailStreak = 0;
+    scanPhase = 'scanning'; scanLineY = 0; scanComplete = false; lockedBox = null; lockFailStreak = 0; pauseUntil = 0;
     const silRet = document.getElementById('face-silhouette');
     if (silRet) silRet.style.opacity = '0.18';
     const video = document.getElementById('video-feed');
@@ -1789,7 +1829,7 @@
     }
 
     if (faceApiReady && stream) {
-      scanPhase = 'scanning'; scanLineY = 0; scanComplete = false; lockedBox = null; faceDetected = false; lockFailStreak = 0;
+      scanPhase = 'scanning'; scanLineY = 0; scanComplete = false; lockedBox = null; faceDetected = false; lockFailStreak = 0; pauseUntil = 0;
       const silSt = document.getElementById('face-silhouette');
       if (silSt) silSt.style.opacity = '0.18';
       startFaceDetection();
