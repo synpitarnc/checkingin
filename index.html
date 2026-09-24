@@ -2012,7 +2012,9 @@
   // ============================================================
   const OUTBOX_KEY        = 'pending_submissions';
   const OUTBOX_MAX_AGE_MS = 10 * 60 * 1000; // 10 นาที
-  const RETRY_DELAY_MS    = 15 * 1000;
+  // ลองส่งใหม่เร็วๆ ก่อน แล้วค่อยห่างขึ้น (เดิมรอ 15 วิทุกครั้ง ทำให้แค่ชนจังหวะ
+  // ระบบยุ่งครั้งเดียวก็ค้าง "กำลังส่ง" นานเกินจำเป็น)
+  const RETRY_DELAYS_MS   = [2000, 4000, 8000, 15000];
   const MAX_ERROR_RETRIES = 5;              // "Error:" จาก server ลองซ้ำได้กี่ครั้ง
   const KEEPALIVE_LIMIT   = 60000;          // browser จำกัด keepalive body ~64KB
 
@@ -2114,8 +2116,13 @@
 
         if (result.kind === 'retry') {
           console.warn('ส่งไม่สำเร็จ จะลองใหม่:', result.msg);
+          item.lastError = result.msg;
+          saveOutbox();
           setSyncStatus(item, 'retry');
-          retryTimer = setTimeout(processOutbox, RETRY_DELAY_MS);
+          // แสดงเหตุผลในประวัติด้วย จะได้รู้ว่าค้างเพราะอะไร (เน็ต / ระบบยุ่ง / error)
+          updateHistory(item.id, 'pending', 'ลองส่งใหม่ครั้งที่ ' + item.attempts + ': ' + String(result.msg).slice(0, 60));
+          const delay = RETRY_DELAYS_MS[Math.min(item.attempts - 1, RETRY_DELAYS_MS.length - 1)] || 2000;
+          retryTimer = setTimeout(processOutbox, delay);
           break;
         }
         finishItem(item, result);
@@ -2185,7 +2192,7 @@
     const el = document.getElementById('popup-sync-label');
     const isIn = item.type === 'เข้างาน';
     if (state === 'pending') { el.className = 'popup-sync pending'; el.textContent = '⏳ กำลังบันทึกลงระบบ...'; }
-    if (state === 'retry')   { el.className = 'popup-sync pending'; el.textContent = '📶 เน็ตไม่เสถียร กำลังลองส่งใหม่อัตโนมัติ...'; }
+    if (state === 'retry')   { el.className = 'popup-sync pending'; el.textContent = '📶 ยังส่งไม่สำเร็จ กำลังลองส่งใหม่อัตโนมัติ...'; }
     if (state === 'ok')      { el.className = 'popup-sync ' + (isIn ? 'ok-in' : 'ok-out'); el.textContent = '✓ บันทึกลงระบบแล้ว'; }
     if (state === 'dup')     { el.className = 'popup-sync err'; el.textContent = '⚠ มีข้อมูลในระบบอยู่แล้ว'; }
     if (state === 'err')     { el.className = 'popup-sync err'; el.textContent = '✗ บันทึกไม่สำเร็จ: ' + (msg || ''); }
@@ -2520,7 +2527,7 @@
         <div class="history-info">
           <div class="history-name">${escapeHTML(item.name)}</div>
           <div class="history-time">${item.date} · ${item.time}</div>
-          ${item.note && item.status !== 'success' ? `<div class="history-note">${escapeHTML(item.note)}</div>` : ''}
+          ${item.note && item.status !== 'success' ? `<div class="history-note" style="${item.status === 'pending' ? 'color:var(--text-dim)' : ''}">${escapeHTML(item.note)}</div>` : ''}
           ${item.driveLink ? `<a href="${item.driveLink}" target="_blank" rel="noopener" style="font-size:11px;color:var(--accent-blue);text-decoration:none;display:inline-flex;align-items:center;gap:3px;margin-top:3px">🔗 ดูรูปภาพ</a>` : ''}
         </div>
         <span class="history-status ${st.cls}">${st.label}</span>
