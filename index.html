@@ -1188,6 +1188,7 @@
   let currentType = 'in';
   let stream = null;
   let capturedImageBase64 = null;
+  let checkoutWaiting = false; // true ระหว่างรอ server ยืนยันการออกงาน (ล็อกปุ่มไว้)
   let selectedDeviceId = localStorage.getItem('camera_device_id') || '';
   // Apps Script Web App URL — ตายตัว ไม่มีหน้าตั้งค่าให้แก้จาก UI แล้ว
   // (พนักงานแต่ละคนใช้เครื่องของตัวเอง ไม่จำเป็นต้องตั้งค่าต่างกันต่อเครื่อง)
@@ -1970,6 +1971,9 @@
     function lock(text)   { submitBtn.disabled = true;  btnLabel.textContent = text; }
     function unlock(text) { submitBtn.disabled = false; btnLabel.textContent = text; }
 
+    // กำลังรอ server ยืนยันการออกงาน — อย่าเขียนทับข้อความ "อย่าเพิ่งปิดเครื่อง"
+    if (checkoutWaiting) return;
+
     // ── ยังไม่ถ่ายรูป ────────────────────────────────────────────
     if (!hasPhoto) {
       lock(currentType === 'in' ? '📷 ถ่ายรูปก่อนเข้างาน' : '📷 ถ่ายรูปก่อนออกงาน');
@@ -2121,6 +2125,7 @@
           setSyncStatus(item, 'retry');
           // แสดงเหตุผลในประวัติด้วย จะได้รู้ว่าค้างเพราะอะไร (เน็ต / ระบบยุ่ง / error)
           updateHistory(item.id, 'pending', 'ลองส่งใหม่ครั้งที่ ' + item.attempts + ': ' + String(result.msg).slice(0, 60));
+          notifyWaiter(item, result, false);
           const delay = RETRY_DELAYS_MS[Math.min(item.attempts - 1, RETRY_DELAYS_MS.length - 1)] || 2000;
           retryTimer = setTimeout(processOutbox, delay);
           break;
@@ -2137,8 +2142,18 @@
     saveOutbox();
   }
 
+  // ผู้รอผลของรายการ (ใช้กับ "ออกงาน" ที่ต้องรอ server ยืนยันก่อนโชว์ป็อปอัพ)
+  const itemWaiters = {};
+  function notifyWaiter(item, result, done) {
+    const fn = itemWaiters[item.id];
+    if (!fn) return;
+    if (done) delete itemWaiters[item.id];
+    try { fn(result); } catch (e) { console.error('waiter error:', e); }
+  }
+
   function finishItem(item, result) {
     removeFromOutbox(item);
+    notifyWaiter(item, result, true);
     const nick = item.name.match(/\(([^)]+)\)/)?.[1] || item.name;
 
     if (result.kind === 'success') {
@@ -2170,13 +2185,14 @@
         const res = await fetch(GAS_URL + '?action=status&name=' + encodeURIComponent(item.name), { redirect: 'follow' });
         const st = JSON.parse(await res.text());
         const done = item.type === 'เข้างาน' ? st.checkin : st.checkout;
-        if (done) { updateHistory(item.id, 'success'); return; }
+        if (done) { updateHistory(item.id, 'success'); notifyWaiter(item, { kind: 'success' }, true); return; }
       } catch (e) { /* เช็คไม่ได้ → ถือว่าไม่ทราบผล ด้านล่าง */ }
     }
 
     const msg = item.attempts > 0
       ? 'ไม่ทราบผล กรุณาตรวจสอบใน Sheet'
       : 'ส่งไม่ทันเวลา กรุณาบันทึกใหม่';
+    notifyWaiter(item, { kind: 'rejected', msg: msg }, true);
     updateHistory(item.id, 'error', msg);
     showToast('❌ ' + nick + ' ' + item.type + ' (' + when + ') ' + msg, 'error');
     refreshStatusIfSelected(item.name);
@@ -2193,7 +2209,7 @@
     const isIn = item.type === 'เข้างาน';
     if (state === 'pending') { el.className = 'popup-sync pending'; el.textContent = '⏳ กำลังบันทึกลงระบบ...'; }
     if (state === 'retry')   { el.className = 'popup-sync pending'; el.textContent = '📶 ยังส่งไม่สำเร็จ กำลังลองส่งใหม่อัตโนมัติ...'; }
-    if (state === 'ok')      { el.className = 'popup-sync ' + (isIn ? 'ok-in' : 'ok-out'); el.textContent = '✓ บันทึกลงระบบแล้ว'; }
+    if (state === 'ok')      { el.className = 'popup-sync ' + (isIn ? 'ok-in' : 'ok-out'); el.textContent = isIn ? '✓ บันทึกลงระบบแล้ว' : '✓ บันทึกลงระบบแล้ว ปิดเครื่องได้เลย'; }
     if (state === 'dup')     { el.className = 'popup-sync err'; el.textContent = '⚠ มีข้อมูลในระบบอยู่แล้ว'; }
     if (state === 'err')     { el.className = 'popup-sync err'; el.textContent = '✗ บันทึกไม่สำเร็จ: ' + (msg || ''); }
   }
@@ -2247,7 +2263,17 @@
       return;
     }
 
-    // ── เข้าคิวส่ง แล้วโชว์ผลทันที (ไม่รอ server) ────────────────
+    // ── ออกงาน: รอ server ยืนยันก่อนค่อยโชว์ป็อปอัพ ──────────────
+    // พนักงานมักปิดเครื่องทันทีที่เห็นป็อปอัพตอนเลิกงาน ถ้าโชว์ก่อนส่งถึง server
+    // (แบบเข้างาน) ข้อมูลออกงานอาจหายหรือส่งไม่ทัน จึงให้ป็อปอัพ = บันทึกลงระบบ
+    // แล้วจริงเท่านั้น (รอ ~2–4 วิ) ส่วนเข้างานยังโชว์ทันทีเหมือนเดิม เพราะหลัง
+    // เข้างานพนักงานยังใช้เครื่องต่อ ข้อมูลจึงส่งเบื้องหลังได้ทัน
+    if (typeLabel === 'ออกงาน') {
+      submitCheckoutConfirmed(name, typeLabel);
+      return;
+    }
+
+    // ── เข้างาน: เข้าคิวส่ง แล้วโชว์ผลทันที (ไม่รอ server) ─────────
     const imageData = capturedImageBase64;
     const item = enqueueSubmission(name, typeLabel, imageData);
     const nickname = name.match(/\(([^)]+)\)/)?.[1] || name;
@@ -2269,6 +2295,60 @@
     // กดบันทึกได้ทันทีโดยใช้ "รูปของคนก่อนหน้า" ซ้ำ (เพราะ hasPhoto ยัง true อยู่)
     // จึงต้องรีเซ็ตกล้อง/รูปถ่ายทุกครั้งที่บันทึกสำเร็จ เพื่อบังคับถ่ายรูปใหม่เสมอ
     retakePhoto();
+
+    processOutbox();
+  }
+
+  function setWaitingButton(text) {
+    const submitBtn = document.getElementById('submit-btn');
+    const btnLabel  = document.getElementById('btn-label');
+    submitBtn.disabled = true;
+    btnLabel.textContent = text;
+    btnLabel.classList.add('btn-label-saving');
+    document.getElementById('spinner').style.display = 'block';
+  }
+
+  function clearWaitingButton() {
+    checkoutWaiting = false;
+    document.getElementById('btn-label').classList.remove('btn-label-saving');
+    document.getElementById('spinner').style.display = 'none';
+    updateSubmitButton();
+  }
+
+  function submitCheckoutConfirmed(name, typeLabel) {
+    const imageData = capturedImageBase64;
+    const nickname = name.match(/\(([^)]+)\)/)?.[1] || name;
+    const item = enqueueSubmission(name, typeLabel, imageData);
+
+    addHistory(name, typeLabel, 'pending', '', item.id);
+    localStorage.setItem('saved_name', name);
+    todayStatus.checkout = true; // กันกดซ้ำระหว่างรอ
+
+    checkoutWaiting = true;
+    setWaitingButton('⏳ กำลังบันทึกออกงาน... อย่าเพิ่งปิดเครื่อง');
+
+    itemWaiters[item.id] = (result) => {
+      if (result.kind === 'retry') {
+        setWaitingButton('📶 ยังส่งไม่สำเร็จ กำลังลองใหม่... อย่าเพิ่งปิดเครื่อง');
+        return;
+      }
+      clearWaitingButton();
+
+      if (result.kind === 'success' || result.kind === 'dup') {
+        // dup = ในระบบมีเวลาออกงานของวันนี้อยู่แล้ว → ถือว่าเรียบร้อย ปิดเครื่องได้
+        todayStatus.checkout = true;
+        renderStatusChips();
+        popupItemId = item.id;
+        showSuccessPopup(nickname, typeLabel, imageData);
+        setSyncStatus(item, result.kind === 'success' ? 'ok' : 'dup');
+        retakePhoto();
+      } else {
+        // ไม่สำเร็จ → คืนปุ่มให้กดใหม่ได้ (รูปยังอยู่ ไม่ต้องถ่ายใหม่)
+        todayStatus.checkout = false;
+        renderStatusChips();
+        updateSubmitButton();
+      }
+    };
 
     processOutbox();
   }
@@ -2309,7 +2389,7 @@
 
     typeEl.textContent = isIn ? '✦ CHECK IN ✦' : '✦ CHECK OUT ✦';
     nameEl.textContent = nickname;
-    msgEl.textContent  = isIn ? 'บันทึกเข้างานแล้ว 🎉' : 'บันทึกออกงานแล้ว 👋';
+    msgEl.textContent  = isIn ? 'บันทึกเข้างานแล้ว 🎉' : 'บันทึกออกงานสำเร็จ 👋';
     timeEl.textContent = timeStr;
     dateEl.textContent = dateStr;
 
