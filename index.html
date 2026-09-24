@@ -515,9 +515,12 @@
     .history-info { flex: 1; min-width: 0; }
     .history-name { font-size: 14px; font-weight: 600; }
     .history-time { font-size: 12px; color: var(--text-dim); font-family: 'Space Mono', monospace; margin-top: 2px; }
+    .history-note { font-size: 11px; color: var(--accent-out); margin-top: 3px; }
 
     .history-status { font-size: 12px; color: var(--accent-in); flex-shrink: 0; }
     .history-status.err { color: var(--accent-out); }
+    .history-status.pending { color: var(--text-dim); animation: blink 1.4s infinite; }
+    .history-status.warn { color: #ffb84d; }
 
     /* ===== MANAGE EMPLOYEES ===== */
     .manage-emp-btn {
@@ -923,9 +926,23 @@
     .popup-date {
       font-size: 13px;
       color: var(--text-dim);
-      margin-bottom: 28px;
+      margin-bottom: 14px;
       animation: slideUp 0.4s ease 0.44s both;
     }
+
+    /* สถานะการส่งข้อมูลเบื้องหลัง (ใต้วันที่ในป็อปอัพ) */
+    .popup-sync {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-bottom: 20px;
+      min-height: 18px;
+      text-align: center;
+      animation: slideUp 0.4s ease 0.46s both;
+    }
+    .popup-sync.pending { animation: slideUp 0.4s ease 0.46s both, textBlink 1.2s ease-in-out infinite; }
+    .popup-sync.ok-in   { color: var(--accent-in); }
+    .popup-sync.ok-out  { color: var(--accent-out); }
+    .popup-sync.err     { color: #ffb84d; }
 
     .popup-close {
       width: 100%;
@@ -1156,6 +1173,7 @@
       <div class="popup-msg"  id="popup-msg-label"></div>
       <div class="popup-time" id="popup-time-label"></div>
       <div class="popup-date" id="popup-date-label"></div>
+      <div class="popup-sync" id="popup-sync-label"></div>
       <button class="popup-close" id="popup-close-btn" onclick="closeSuccessPopup()">ตกลง</button>
     </div>
   </div>
@@ -1599,12 +1617,6 @@
   // ============================================================
   // CLOCK
   // ============================================================
-  // ============================================================
-  // CLOCK
-  // ============================================================
-  // ============================================================
-  // CLOCK
-  // ============================================================
   function updateClock() {
     const now = new Date();
     document.getElementById('live-clock').textContent =
@@ -1916,14 +1928,22 @@
     }
     if (myRequestId !== statusRequestId) return; // กันอัปเดต UI ผิดคนด้วย
 
-    // อัปเดต UI chip
-    chipIn.className  = todayStatus.checkin  ? 'status-chip done-in'  : 'status-chip';
-    chipOut.className = todayStatus.checkout ? 'status-chip done-out' : 'status-chip';
-    chipInTxt.textContent  = todayStatus.checkin  ? '✓ Check-in แล้ว'  : 'ยังไม่ Check-in';
-    chipOutTxt.textContent = todayStatus.checkout ? '✓ Check-out แล้ว' : 'ยังไม่ Check-out';
+    // รายการที่ยังรอส่งอยู่ในคิว (outbox) ยังไม่ถึง server — ต้องนับรวมด้วย
+    // ไม่งั้น server จะตอบว่า "ยังไม่ Check-in" แล้วปุ่มปลดล็อกให้กดซ้ำได้
+    applyPendingToStatus(name, todayStatus);
+    renderStatusChips();
 
     // อัปเดตปุ่มบันทึก
     updateSubmitButton();
+  }
+
+  function renderStatusChips() {
+    const chipIn  = document.getElementById('chip-in');
+    const chipOut = document.getElementById('chip-out');
+    chipIn.className  = todayStatus.checkin  ? 'status-chip done-in'  : 'status-chip';
+    chipOut.className = todayStatus.checkout ? 'status-chip done-out' : 'status-chip';
+    document.getElementById('chip-in-text').textContent  = todayStatus.checkin  ? '✓ Check-in แล้ว'  : 'ยังไม่ Check-in';
+    document.getElementById('chip-out-text').textContent = todayStatus.checkout ? '✓ Check-out แล้ว' : 'ยังไม่ Check-out';
   }
 
   function updateCaptureButton() {
@@ -1973,9 +1993,218 @@
   }
 
   // ============================================================
+  // OUTBOX — ส่งข้อมูลเบื้องหลัง (โชว์สำเร็จทันที ไม่ต้องรอ server)
+  //
+  // เดิม submitData() รอ Apps Script ตอบกลับก่อนโชว์ป็อปอัพ (~2–4 วิ ส่วนใหญ่
+  // เป็นเวลาขั้นต่ำของ Apps Script เองที่ลดไม่ได้) ตอนนี้เปลี่ยนเป็น:
+  //   1) กดบันทึก → เก็บรายการลง "outbox" (localStorage) → โชว์ป็อปอัพทันที
+  //   2) ส่งไป server เบื้องหลัง ป็อปอัพ/ประวัติจะอัปเดตเป็น "✓ บันทึกลงระบบแล้ว"
+  //   3) ส่งไม่ผ่าน (เน็ตหลุด/ระบบยุ่ง) → เก็บไว้ในเครื่อง แล้วลองส่งใหม่เองทุก
+  //      15 วิ / ตอนเน็ตกลับมา / ตอนเปิดหน้าเว็บครั้งถัดไป
+  //
+  // กันเวลาเพี้ยน: เวลาที่บันทึกคือเวลาที่ server ได้รับ (ไม่เชื่อนาฬิกาเครื่อง
+  // กันการแก้เวลาเครื่องโกง) รายการที่ค้างเกิน OUTBOX_MAX_AGE_MS จะไม่ถูกส่ง
+  // (เพราะเวลาจะคลาดจากจริงมาก หรือกลายเป็นของวันถัดไป) แต่จะแจ้งให้บันทึกใหม่แทน
+  //
+  // ปิดแท็บ: ใช้ fetch keepalive (ถ้าขนาดข้อมูล < 60KB) ทำให้ browser ส่งต่อจนจบ
+  // แม้ปิดแท็บไปแล้ว — แต่ถ้าปิดฝาโน้ตบุ๊ก/ล็อกจอมือถือก่อนส่งเสร็จ เครื่องจะ
+  // หยุดส่ง แล้วค่อยส่งต่อเมื่อเปิดหน้าเว็บอีกครั้ง (ภายในเวลาที่กำหนด)
+  // ============================================================
+  const OUTBOX_KEY        = 'pending_submissions';
+  const OUTBOX_MAX_AGE_MS = 10 * 60 * 1000; // 10 นาที
+  const RETRY_DELAY_MS    = 15 * 1000;
+  const MAX_ERROR_RETRIES = 5;              // "Error:" จาก server ลองซ้ำได้กี่ครั้ง
+  const KEEPALIVE_LIMIT   = 60000;          // browser จำกัด keepalive body ~64KB
+
+  let outbox = loadOutbox();
+  let outboxBusy = false;
+  let retryTimer = null;
+  let popupItemId = null; // รายการที่ป็อปอัพกำลังแสดงอยู่ (ใช้อัปเดตบรรทัดสถานะ)
+
+  function loadOutbox() {
+    try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]'); } catch (e) { return []; }
+  }
+  function saveOutbox() {
+    try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox)); }
+    catch (e) { console.warn('saveOutbox error (เก็บไว้ในหน่วยความจำแทน):', e); }
+  }
+
+  function sameDay(ts1, ts2) {
+    return new Date(ts1).toDateString() === new Date(ts2).toDateString();
+  }
+
+  // รวมรายการที่ยังรอส่งของคนนี้ (วันนี้) เข้าไปในสถานะ
+  function applyPendingToStatus(name, status) {
+    outbox.forEach(item => {
+      if (item.name !== name || !sameDay(item.createdAt, Date.now())) return;
+      if (item.type === 'เข้างาน') status.checkin  = true;
+      if (item.type === 'ออกงาน') status.checkout = true;
+    });
+  }
+
+  function enqueueSubmission(name, type, image) {
+    const item = {
+      id: 'sub_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+      name, type, image,
+      createdAt: Date.now(),
+      attempts: 0
+    };
+    outbox.push(item);
+    saveOutbox();
+    return item;
+  }
+
+  async function sendSubmission(item) {
+    // นับครั้งที่ส่ง "ก่อน" ยิงจริง แล้ว save ลงเครื่อง — ถ้าหน้าเว็บถูกปิดระหว่างส่ง
+    // (request อาจไปถึง server แล้ว แต่เราไม่ได้อ่านคำตอบ) รอบหน้าที่ได้ Duplicate
+    // จะรู้ว่านั่นคือรายการของเราเองที่ส่งสำเร็จไปแล้ว ไม่ใช่การกดซ้ำ
+    item.attempts++;
+    saveOutbox();
+
+    const payload = JSON.stringify({ name: item.name, type: item.type, image: item.image });
+    const __clientT0 = performance.now();
+    const res = await fetch(GAS_URL, {
+      method: 'POST',
+      body: payload,
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      redirect: 'follow',
+      keepalive: payload.length < KEEPALIVE_LIMIT
+    });
+    const text = await res.text();
+
+    const __clientTotalMs = Math.round(performance.now() - __clientT0);
+    const __srvMatch = text.match(/srvms=(\d+)/);
+    const __srvMs = __srvMatch ? parseInt(__srvMatch[1], 10) : null;
+    console.log(
+      `[timing] client round-trip: ${__clientTotalMs}ms` +
+      (__srvMs !== null ? ` | server execution: ${__srvMs}ms | network+platform overhead: ~${__clientTotalMs - __srvMs}ms` : ' | (no server timing in response)')
+    );
+    console.log('Apps Script response:', text);
+
+    if (text.startsWith('Success'))   return { kind: 'success' };
+    if (text.startsWith('Duplicate')) return item.attempts > 1
+      ? { kind: 'success' }                                    // รอบก่อนส่งถึงแล้ว
+      : { kind: 'dup', msg: text.replace('Duplicate: ', '') };
+    if (text.startsWith('NoCheckin')) return { kind: 'rejected', msg: 'ยังไม่ได้ Check-in วันนี้' };
+    if (text.includes('ระบบกำลังยุ่ง')) return { kind: 'retry', msg: 'ระบบกำลังยุ่ง' };
+    if (item.attempts < MAX_ERROR_RETRIES) return { kind: 'retry', msg: text };
+    return { kind: 'rejected', msg: (text || 'ไม่ได้รับการตอบกลับ').slice(0, 80) };
+  }
+
+  async function processOutbox() {
+    if (outboxBusy || !GAS_URL) return;
+    outboxBusy = true;
+    clearTimeout(retryTimer); retryTimer = null;
+    try {
+      while (outbox.length > 0) {
+        const item = outbox[0];
+
+        if (Date.now() - item.createdAt > OUTBOX_MAX_AGE_MS) {
+          await finishExpired(item);
+          continue;
+        }
+
+        let result;
+        try {
+          result = await sendSubmission(item);
+        } catch (err) {
+          // เน็ตหลุด / fetch ล้มเหลว → ลองใหม่ทีหลัง
+          result = { kind: 'retry', msg: err.message || 'เชื่อมต่อไม่ได้' };
+        }
+
+        if (result.kind === 'retry') {
+          console.warn('ส่งไม่สำเร็จ จะลองใหม่:', result.msg);
+          setSyncStatus(item, 'retry');
+          retryTimer = setTimeout(processOutbox, RETRY_DELAY_MS);
+          break;
+        }
+        finishItem(item, result);
+      }
+    } finally {
+      outboxBusy = false;
+    }
+  }
+
+  function removeFromOutbox(item) {
+    outbox = outbox.filter(x => x.id !== item.id);
+    saveOutbox();
+  }
+
+  function finishItem(item, result) {
+    removeFromOutbox(item);
+    const nick = item.name.match(/\(([^)]+)\)/)?.[1] || item.name;
+
+    if (result.kind === 'success') {
+      updateHistory(item.id, 'success');
+      setSyncStatus(item, 'ok');
+      return;
+    }
+    if (result.kind === 'dup') {
+      updateHistory(item.id, 'dup', 'มีข้อมูลในระบบอยู่แล้ว');
+      setSyncStatus(item, 'dup');
+      showToast('⚠️ ' + result.msg, 'error');
+    } else {
+      updateHistory(item.id, 'error', result.msg);
+      setSyncStatus(item, 'err', result.msg);
+      showToast('❌ ' + nick + ' ' + item.type + ' ไม่สำเร็จ: ' + result.msg, 'error');
+    }
+    refreshStatusIfSelected(item.name);
+  }
+
+  // รายการค้างนานเกินไป — ไม่ส่งแล้ว (กันเวลาเพี้ยน/ข้ามวัน) แต่ถ้าเคยยิงไปแล้ว
+  // อาจถึง server แล้วก็ได้ → เช็คสถานะจริงก่อนตัดสินว่าสำเร็จหรือไม่
+  async function finishExpired(item) {
+    removeFromOutbox(item);
+    const nick = item.name.match(/\(([^)]+)\)/)?.[1] || item.name;
+    const when = new Date(item.createdAt).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+
+    if (item.attempts > 0 && sameDay(item.createdAt, Date.now())) {
+      try {
+        const res = await fetch(GAS_URL + '?action=status&name=' + encodeURIComponent(item.name), { redirect: 'follow' });
+        const st = JSON.parse(await res.text());
+        const done = item.type === 'เข้างาน' ? st.checkin : st.checkout;
+        if (done) { updateHistory(item.id, 'success'); return; }
+      } catch (e) { /* เช็คไม่ได้ → ถือว่าไม่ทราบผล ด้านล่าง */ }
+    }
+
+    const msg = item.attempts > 0
+      ? 'ไม่ทราบผล กรุณาตรวจสอบใน Sheet'
+      : 'ส่งไม่ทันเวลา กรุณาบันทึกใหม่';
+    updateHistory(item.id, 'error', msg);
+    showToast('❌ ' + nick + ' ' + item.type + ' (' + when + ') ' + msg, 'error');
+    refreshStatusIfSelected(item.name);
+  }
+
+  function refreshStatusIfSelected(name) {
+    const sel = document.getElementById('name-input').value.trim();
+    if (sel === name) checkEmployeeStatus(name);
+  }
+
+  function setSyncStatus(item, state, msg) {
+    if (popupItemId !== item.id) return;
+    const el = document.getElementById('popup-sync-label');
+    const isIn = item.type === 'เข้างาน';
+    if (state === 'pending') { el.className = 'popup-sync pending'; el.textContent = '⏳ กำลังบันทึกลงระบบ...'; }
+    if (state === 'retry')   { el.className = 'popup-sync pending'; el.textContent = '📶 เน็ตไม่เสถียร กำลังลองส่งใหม่อัตโนมัติ...'; }
+    if (state === 'ok')      { el.className = 'popup-sync ' + (isIn ? 'ok-in' : 'ok-out'); el.textContent = '✓ บันทึกลงระบบแล้ว'; }
+    if (state === 'dup')     { el.className = 'popup-sync err'; el.textContent = '⚠ มีข้อมูลในระบบอยู่แล้ว'; }
+    if (state === 'err')     { el.className = 'popup-sync err'; el.textContent = '✗ บันทึกไม่สำเร็จ: ' + (msg || ''); }
+  }
+
+  // เตือนก่อนปิดแท็บ/รีโหลด ถ้ายังมีรายการที่ส่งไม่เสร็จ (ใช้ได้บนคอม — มือถือ
+  // ส่วนใหญ่ไม่แสดงกล่องเตือนนี้ แต่ข้อมูลยังค้างใน outbox รอส่งรอบหน้า)
+  window.addEventListener('beforeunload', (e) => {
+    if (outbox.length > 0) { e.preventDefault(); e.returnValue = ''; }
+  });
+  window.addEventListener('online', () => processOutbox());
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && outbox.length > 0) processOutbox();
+  });
+
+  // ============================================================
   // SUBMIT
   // ============================================================
-  async function submitData() {
+  function submitData() {
     const name = document.getElementById('name-input').value.trim();
     if (!name) {
       showToast('⚠️ กรุณาเลือกชื่อพนักงานก่อน', 'error');
@@ -2011,86 +2240,30 @@
       return;
     }
 
-    // UI loading state
-    const submitBtn = document.getElementById('submit-btn');
-    const btnLabel  = document.getElementById('btn-label');
-    const spinner   = document.getElementById('spinner');
-    submitBtn.disabled = true;
-    const prevLabelText = btnLabel.textContent;
-    btnLabel.textContent = 'กำลังบันทึกข้อมูล';
-    btnLabel.classList.add('btn-label-saving');
-    btnLabel.style.display = 'inline';
-    spinner.style.display = 'block';
-
+    // ── เข้าคิวส่ง แล้วโชว์ผลทันที (ไม่รอ server) ────────────────
     const imageData = capturedImageBase64;
+    const item = enqueueSubmission(name, typeLabel, imageData);
+    const nickname = name.match(/\(([^)]+)\)/)?.[1] || name;
 
-    try {
-      const payload = JSON.stringify({ name, type: typeLabel, image: imageData });
-      const __clientT0 = performance.now();
-      const res = await fetch(GAS_URL, {
-        method: 'POST',
-        body: payload,
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        redirect: 'follow'
-      });
+    addHistory(name, typeLabel, 'pending', '', item.id);
+    localStorage.setItem('saved_name', name);
 
-      const text = await res.text();
-      const __clientTotalMs = Math.round(performance.now() - __clientT0);
-      const __srvMatch = text.match(/srvms=(\d+)/);
-      const __srvMs = __srvMatch ? parseInt(__srvMatch[1], 10) : null;
-      console.log(
-        `[timing] client round-trip: ${__clientTotalMs}ms` +
-        (__srvMs !== null ? ` | server execution: ${__srvMs}ms | network+platform overhead: ~${__clientTotalMs - __srvMs}ms` : ' | (no server timing in response)')
-      );
-      console.log('Apps Script response:', text);
+    // อัปเดตสถานะทันที (กันกดซ้ำระหว่างรอส่ง)
+    if (typeLabel === 'เข้างาน')  todayStatus.checkin  = true;
+    if (typeLabel === 'ออกงาน') todayStatus.checkout = true;
+    renderStatusChips();
 
-      if (text.startsWith('Success')) {
-        const driveLink = text.split('|')[1] || '';
-        const nickname = name.match(/\(([^)]+)\)/)?.[1] || name;
-        addHistory(name, typeLabel, 'success', driveLink);
-        localStorage.setItem('saved_name', name);
+    popupItemId = item.id;
+    showSuccessPopup(nickname, typeLabel, imageData);
+    setSyncStatus(item, 'pending');
 
-        // อัปเดตสถานะทันที
-        if (typeLabel === 'เข้างาน')  todayStatus.checkin  = true;
-        if (typeLabel === 'ออกงาน') todayStatus.checkout = true;
+    // บั๊ค (แก้แล้ว): เดิมรูปที่ถ่ายไว้จะค้างอยู่ในตัวแปรหลังบันทึกสำเร็จ
+    // ถ้าพนักงานคนถัดไปมาสแกนต่อโดยไม่ได้สลับปุ่ม เข้างาน/ออกงาน ระบบจะยอมให้
+    // กดบันทึกได้ทันทีโดยใช้ "รูปของคนก่อนหน้า" ซ้ำ (เพราะ hasPhoto ยัง true อยู่)
+    // จึงต้องรีเซ็ตกล้อง/รูปถ่ายทุกครั้งที่บันทึกสำเร็จ เพื่อบังคับถ่ายรูปใหม่เสมอ
+    retakePhoto();
 
-        // อัปเดต chips
-        const chipIn  = document.getElementById('chip-in');
-        const chipOut = document.getElementById('chip-out');
-        if (typeLabel === 'เข้างาน') {
-          chipIn.className = 'status-chip done-in';
-          document.getElementById('chip-in-text').textContent = '✓ Check-in แล้ว';
-        } else {
-          chipOut.className = 'status-chip done-out';
-          document.getElementById('chip-out-text').textContent = '✓ Check-out แล้ว';
-        }
-
-        showSuccessPopup(nickname, typeLabel, capturedImageBase64);
-
-        // บั๊ค (แก้แล้ว): เดิมรูปที่ถ่ายไว้จะค้างอยู่ในตัวแปรหลังบันทึกสำเร็จ
-        // ถ้าพนักงานคนถัดไปมาสแกนต่อโดยไม่ได้สลับปุ่ม เข้างาน/ออกงาน ระบบจะยอมให้
-        // กดบันทึกได้ทันทีโดยใช้ "รูปของคนก่อนหน้า" ซ้ำ (เพราะ hasPhoto ยัง true อยู่)
-        // จึงต้องรีเซ็ตกล้อง/รูปถ่ายทุกครั้งที่บันทึกสำเร็จ เพื่อบังคับถ่ายรูปใหม่เสมอ
-        retakePhoto();
-
-      } else if (text.startsWith('Duplicate')) {
-        showToast('⚠️ ' + text.replace('Duplicate: ', ''), 'error');
-      } else if (text.startsWith('NoCheckin')) {
-        showToast('⚠️ ยังไม่ได้ Check-in วันนี้', 'error');
-      } else {
-        throw new Error(text || 'ไม่ได้รับการตอบกลับ');
-      }
-    } catch (err) {
-      console.error('Submit error:', err);
-      showToast('❌ ' + (err.message || 'เกิดข้อผิดพลาด').slice(0, 60), 'error');
-      addHistory(name, typeLabel, 'error', '');
-    } finally {
-      submitBtn.disabled = false;
-      btnLabel.classList.remove('btn-label-saving');
-      btnLabel.style.display = 'inline';
-      spinner.style.display = 'none';
-      updateSubmitButton();
-    }
+    processOutbox();
   }
 
   // ============================================================
@@ -2129,7 +2302,7 @@
 
     typeEl.textContent = isIn ? '✦ CHECK IN ✦' : '✦ CHECK OUT ✦';
     nameEl.textContent = nickname;
-    msgEl.textContent  = isIn ? 'บันทึกเข้างานสำเร็จแล้ว 🎉' : 'บันทึกออกงานสำเร็จแล้ว 👋';
+    msgEl.textContent  = isIn ? 'บันทึกเข้างานแล้ว 🎉' : 'บันทึกออกงานแล้ว 👋';
     timeEl.textContent = timeStr;
     dateEl.textContent = dateStr;
 
@@ -2157,6 +2330,7 @@
 
   function closeSuccessPopup() {
     clearTimeout(window._popupTimer);
+    popupItemId = null;
     const popup = document.getElementById('success-popup');
     popup.className = 'hide';
     setTimeout(() => { popup.className = ''; popup.style.opacity = '0'; }, 300);
@@ -2297,18 +2471,40 @@
 
   // ============================================================
   // HISTORY
+  // status: 'pending' (กำลังส่ง) | 'success' | 'dup' (มีข้อมูลอยู่แล้ว) | 'error'
   // ============================================================
-  function addHistory(name, type, status, driveLink = '') {
+  function addHistory(name, type, status, driveLink = '', id = null, note = '') {
     const item = {
-      name, type, status, driveLink,
+      id, name, type, status, driveLink, note,
       time: new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }),
       date: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' })
     };
     history.unshift(item);
     if (history.length > 20) history.pop();
-    localStorage.setItem('checkin_history', JSON.stringify(history));
+    saveHistory();
+    renderHistory();
+    return item;
+  }
+
+  function updateHistory(id, status, note = '') {
+    const h = history.find(x => x.id === id);
+    if (!h) return;
+    h.status = status;
+    h.note = note;
+    saveHistory();
     renderHistory();
   }
+
+  function saveHistory() {
+    try { localStorage.setItem('checkin_history', JSON.stringify(history)); } catch (e) {}
+  }
+
+  const HISTORY_STATUS = {
+    pending: { cls: 'pending', label: '⏳ กำลังส่ง' },
+    success: { cls: '',        label: '✓ สำเร็จ' },
+    dup:     { cls: 'warn',    label: '⚠ มีอยู่แล้ว' },
+    error:   { cls: 'err',     label: '✗ ไม่สำเร็จ' }
+  };
 
   function renderHistory() {
     const list = document.getElementById('history-list');
@@ -2316,17 +2512,21 @@
       list.innerHTML = '<div style="text-align:center;color:var(--text-dim);font-size:13px;padding:16px 0">ยังไม่มีประวัติ</div>';
       return;
     }
-    list.innerHTML = history.map(item => `
+    list.innerHTML = history.map(item => {
+      const st = HISTORY_STATUS[item.status] || HISTORY_STATUS.error;
+      return `
       <div class="history-item">
         <span class="history-badge ${item.type === 'เข้างาน' ? 'badge-in' : 'badge-out'}">${item.type}</span>
         <div class="history-info">
           <div class="history-name">${escapeHTML(item.name)}</div>
           <div class="history-time">${item.date} · ${item.time}</div>
+          ${item.note && item.status !== 'success' ? `<div class="history-note">${escapeHTML(item.note)}</div>` : ''}
           ${item.driveLink ? `<a href="${item.driveLink}" target="_blank" rel="noopener" style="font-size:11px;color:var(--accent-blue);text-decoration:none;display:inline-flex;align-items:center;gap:3px;margin-top:3px">🔗 ดูรูปภาพ</a>` : ''}
         </div>
-        <span class="history-status ${item.status === 'error' ? 'err' : ''}">${item.status === 'success' ? '✓ สำเร็จ' : '✗ ผิดพลาด'}</span>
+        <span class="history-status ${st.cls}">${st.label}</span>
       </div>
-    `).join('');
+    `;
+    }).join('');
   }
 
   function clearHistory() {
@@ -2336,7 +2536,7 @@
   }
 
   function escapeHTML(str) {
-    return str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+    return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   }
 
   // ============================================================
@@ -2358,6 +2558,18 @@
   // INIT
   // ============================================================
   window.addEventListener('load', async () => {
+    // ส่งรายการที่ค้างจากรอบก่อน (เช่น ปิดแท็บ/เน็ตหลุดก่อนส่งเสร็จ) — ทำก่อน
+    // เปิดกล้อง เพราะ startCamera อาจรอสิทธิ์กล้องนาน
+    // ประวัติที่ยังค้าง "กำลังส่ง" แต่ไม่มีใน outbox แล้ว (เช่น บันทึกลงเครื่องไม่ได้
+    // ตอนนั้น) → ไม่รู้ผลแน่ชัด ให้แจ้งให้ตรวจสอบแทนการค้างสถานะไว้ตลอด
+    history.forEach(h => {
+      if (h.status === 'pending' && !outbox.some(o => o.id === h.id)) {
+        h.status = 'error'; h.note = 'ไม่ทราบผล กรุณาตรวจสอบใน Sheet';
+      }
+    });
+    saveHistory();
+    if (outbox.length > 0) processOutbox();
+
     // First get permission, then enumerate devices for accurate labels
     await startCamera();
     await enumerateDevices();
